@@ -9,14 +9,16 @@ import functools
 # Hydra
 from omegaconf import DictConfig, OmegaConf
 import hydra
+#
 import logging
-# BIND
-from ProteinLigandGym.env.bind_inference import init_BIND, predict_binder, get_graph
-
 import heapq
 import json
 import threading
 import queue
+# BIND
+from ProteinLigandGym.env.bind_inference import init_BIND, predict_binder, get_graph
+
+log = logging.getLogger(__name__)
 
 class TopSequencesTracker:
     def __init__(self, max_size=1000, filename='top_sequences.json'):
@@ -57,7 +59,6 @@ class TopSequencesTracker:
         except FileNotFoundError:
             print(f"File {self.filename} not found. Starting with an empty list.")
 
-log = logging.getLogger(__name__)
 
 class ProteinLigandInteractionEnv(AECEnv):
 
@@ -150,19 +151,41 @@ class ProteinLigandInteractionEnv(AECEnv):
                     "bind_conv5_e": spaces.Box(low=-100, high=100, shape=[self.smile_graph.edge_index.size()[1],self.smile_graph.edge_index.size()[0]], dtype=np.float32),
                 }
             )
-        }
-        
+        }        
         self.render_mode = render_mode
 
+        # cla moving here
+        self.lookup_table_int_to_aa = {idx: amino_acid for idx, amino_acid in enumerate(self.amino_acids_sequence_actions)}
+        self.lookup_table_aa_to_int = {amino_acid: np.uint32(idx) for idx, amino_acid in enumerate(self.amino_acids_sequence_actions)}
+        self.action_type = "1D" # 1D, 2D, 3D
+        self.actions2D = {} # map from 2D action codes to 1D action codes, TODO
+        self.wildtype_baselines()
+
+    def wildtype_baselines(self):
+        score = predict_binder(self.ba_model, self.esm_model, self.esm_tokeniser, self.device,
+                                [self.wildtype_aa_seq], self.ligand_dict['smile'])
+        self.binding_affinity = score[0]['non_binder_prob']
+        self.binding_reward_wildtype = (1.0 - float(self.binding_affinity))
+        print(f"WILDTYPE BASELINE reward = {self.binding_reward_wildtype}")
+
+    def calc_2D_advantage(self, action):
+        return 
+
+    def calc_3D_advantage(self, action):
+        return 
+
+    def set_sequence(self, sequence): # cla , called by frontier buffer
+        self.wildtype_aa_seq = sequence
 
     def reset(self, seed=None, options=None):
-        log.info("Executing 'reset' ...")
+        log.info("ProteinLigandInteractionEnv: Executing 'reset' ...")
 
         self.agents = copy(self.possible_agents)
         self.timestep = 0
         self.rewards = {agent: 0 for agent in self.agents}
         self.mask_penalty = 0 # remove
         self.binding_reward = 0
+        self.last_binding_reward = self.binding_reward_wildtype # cla 
         self.clustering_score = 0
         self.num_edits = 0
 
@@ -170,7 +193,7 @@ class ProteinLigandInteractionEnv(AECEnv):
         self.terminations = {agent: False for agent in self.agents}
         self.truncations = {agent: False for agent in self.agents}
 
-        self.mutant_aa_seq = self.wildtype_aa_seq
+        self.mutant_aa_seq = self.wildtype_aa_seq  
         self.mutation_site = np.zeros(len(self.mutant_aa_seq))
 
         crossattention4_graph_batch_space= self._observation_spaces["mutation_site_picker"]["bind_crossattention4_graph_batch"]
@@ -239,10 +262,11 @@ class ProteinLigandInteractionEnv(AECEnv):
                 "mutation_site_filler": self.binding_reward
             }
 
-            self.tracker.add_sequence(self.mutant_aa_seq, self.binding_reward, 0)
-
             # Adds .rewards to ._cumulative_rewards
             self._accumulate_rewards()
+
+            other_scores = (score[0]['pKi'],score[0]['pIC50'],score[0]['pKd'],score[0]['pEC50'])
+            self.tracker.add_sequence(self.mutant_aa_seq, (1.0 - float(self.binding_affinity)), other_scores) # cla added other_scores, changed to cumulative reward
 
             # Check truncation conditions (overwrites termination conditions)
             self.truncations = { "mutation_site_picker": False, "mutation_site_filler": False}
@@ -279,14 +303,7 @@ class ProteinLigandInteractionEnv(AECEnv):
             
             mask = self._mask_string(self.mutant_aa_seq,self.mutation_site)
             sequence = self.mutant_aa_seq
-            string = f"""
-
-Step:                   {self.timestep}
-Reward:                 {self.rewards[self.agent_selection]}  
-
-{mask}
-{sequence}
-            """
+            string = f"Step: {self.timestep:>2} reward: {self.rewards[self.agent_selection]:>7.4f}, total reward: {self._cumulative_rewards[self.agent_selection]:>7.4f}, sequence value: {(1.0 - float(self.binding_affinity)):>7.4f})"  
         else:
             string = "!!!!!!!!!!!!   Episode finished   !!!!!!!!!!!!"
             
@@ -368,14 +385,13 @@ Reward:                 {self.rewards[self.agent_selection]}
         return  crossattention4_graph_batch, crossattention4_hidden_states_30, crossattention4_padding_mask, conv5_x, conv5_a, conv5_e
     
     def decode_aa_sequence(self,action):
-        vocabulary = self.amino_acids_sequence_actions
-        lookup_table_int_to_aa = {idx: amino_acid for idx, amino_acid in enumerate(vocabulary)}
-        return ''.join(lookup_table_int_to_aa[act] for act in action)
+        if self.action_type == "1D":
+            return ''.join(self.lookup_table_int_to_aa[act] for act in action)
+        elif self.action_type == "2D":  # TODO, will only work if site picking, and aa selection is signle action
+            return ''.join(self.lookup_table_int_to_aa[act] for act2D in action for act in self.actions2D[act2D])
 
     def encode_aa_sequence(self,aa_sequence):
-        vocabulary = self.amino_acids_sequence_actions
-        lookup_table_aa_to_int = {amino_acid: np.uint32(idx) for idx, amino_acid in enumerate(vocabulary)}
-        return np.array([lookup_table_aa_to_int[aa] for aa in aa_sequence], dtype=np.uint32)
+        return np.array([self.lookup_table_aa_to_int[aa] for aa in aa_sequence], dtype=np.uint32)
     
     def _mask_string(self, string, mask):
         char_array = np.array(list(string))
@@ -385,9 +401,9 @@ Reward:                 {self.rewards[self.agent_selection]}
     
     # Create bigger holes in sequence at location -> more control for pLM
     def _expand_mutation_site(self,action):
-        hole_size=self.config.agents.filler_plm.self_determination 
+        hole_size = self.config.agents.filler_plm.self_determination 
         # Find the index of the 1 in the action vector
-        one_index = np.where(action == 1)[0][0]
+        one_index = np.where(action == 1)[0][0]  # cla: chrashes here due to nan actions if steps_per_collect (conf) is too low
         
         # Calculate the start and end indices for the hole
         start = max(0, one_index - hole_size // 2)
@@ -401,4 +417,8 @@ Reward:                 {self.rewards[self.agent_selection]}
 
     def _calculate_binding_reward(self):
         binding_reward = (1.0 - float(self.binding_affinity))
-        return binding_reward
+        delta = binding_reward - self.last_binding_reward  
+        self.last_binding_reward = binding_reward
+        #return binding_reward
+        return delta  # cla: changed 29.Oct.2024
+    

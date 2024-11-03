@@ -6,6 +6,13 @@ from transformers import logging, AutoModel, AutoTokenizer
 from torch_geometric.data import Batch
 import sys
 import logging
+
+#def this_package_path(): # cla added
+#    return os.path.dirname(os.path.realpath(__file__)).split('rl-enzyme-engineering')[0]
+from helpers import this_package_path
+sys.path.append(this_package_path() + "/rl-enzyme-engineering/src/ProteinLigandGym/env/models")
+sys.path.append(this_package_path() + "/rl-enzyme-engineering/src/ProteinLigandGym/env/models/BIND")
+
 from BIND import loading
 from BIND.data import BondType
 from torch_geometric.utils.sparse import dense_to_sparse
@@ -14,6 +21,9 @@ from tqdm import tqdm
 from Bio import SeqIO
 
 log = logging.getLogger(__name__)
+
+def this_package_path(): # cla added
+    return os.path.dirname(os.path.realpath(__file__)).split('rl-enzyme-engineering')[0]
 
 def predict_binder(bind_model, esm_model, esm_tokeniser, device, sequences, ligand_smile):
 
@@ -60,7 +70,7 @@ def init_BIND(device):
     esm_model.eval()
     esm_model.to(device)
 
-    model = torch.load("/root/projects/rl-enzyme-engineering/src/ProteinLigandGym/env/models/BIND/saves/BIND_checkpoint_12042024.pth", map_location=device)
+    model = torch.load(this_package_path()+"/rl-enzyme-engineering/src/ProteinLigandGym/env/models/BIND/saves/BIND_checkpoint_12042024.pth", map_location=device)
     model.eval()
     model.to(device)
     
